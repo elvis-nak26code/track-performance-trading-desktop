@@ -3,4 +3,5 @@ release/
 dist/
 dist-desktop/
 vendor/node-win-x64/
+vendor/node-linux-x64/
 *.log

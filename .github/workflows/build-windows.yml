@@ -1,8 +1,9 @@
-// Workflow GitHub Actions : à CHAQUE push, build l'exécutable Windows
-// (BlackTracker Setup .exe) avec l'icône, better-sqlite3 recompilé pour
-// Windows (module natif) et le rendu desktop re-fabriqué à partir du
-// frontend le plus récent — donc chaque mise à jour est prise en compte.
-name: Build Windows (BlackTracker)
+# Workflow GitHub Actions : à CHAQUE push, build les distributeurs
+# Windows (.exe) et Linux (.deb + AppImage) avec les icônes, better-sqlite3
+# recompilé natif pour la plateforme cible et le rendu desktop re-fabriqué à
+# partir du frontend le plus récent — donc chaque mise à jour est prise en
+# compte. Les applications sont autonomes : le runtime Node est embarqué.
+name: Build BlackTracker (Windows + Linux)
 
 on:
   push:
@@ -71,4 +72,61 @@ jobs:
         with:
           name: BlackTracker-Windows-x64
           path: desktop/release/*Setup*.exe
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout desktop
+        uses: actions/checkout@v4
+        with:
+          path: desktop
+
+      # Le frontend le plus récent -> /workspace/frontend
+      - name: Checkout frontend (latest)
+        uses: actions/checkout@v4
+        with:
+          repository: elvis-nak26code/track-performance-trading
+          path: frontend
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Fabrique le rendu desktop (vite mode desktop -> dist-desktop)
+      - name: Build du rendu desktop
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:desktop
+
+      # better-sqlite3 compilé pour Linux (ABI Node 24, identique au runtime embarqué)
+      - name: Installation des dépendances desktop
+        working-directory: desktop
+        run: npm ci
+
+      # Runtime Node portable Linux (Node v24.21.0, cf. ABI better-sqlite3 ci-dessus)
+      - name: Télécharger le runtime Node portable (Linux)
+        shell: bash
+        run: |
+          nodev="v24.21.0"
+          mkdir -p desktop/vendor/node-linux-x64
+          curl -sL "https://nodejs.org/dist/$nodev/node-$nodev-linux-x64.tar.xz" -o /tmp/node-linux.tar.xz
+          tar -xf /tmp/node-linux.tar.xz -C /tmp "node-$nodev-linux-x64/bin/node"
+          cp "/tmp/node-$nodev-linux-x64/bin/node" desktop/vendor/node-linux-x64/node
+
+      # .deb + AppImage avec icône (menu des applications) + Node embarqué
+      - name: Build Linux (.deb + AppImage)
+        working-directory: desktop
+        run: npx electron-builder --linux deb AppImage --x64
+
+      - name: Upload .deb et AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackTracker-Linux-x64
+          path: |
+            desktop/release/*.deb
+            desktop/release/*.AppImage
           if-no-files-found: error

@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "BlackTracker — application de bureau offline-first (Electron + base SQLite locale + synchro avec l'API distante).",
   "author": "BlackTracker",
+  "desktopName": "BlackTracker",
   "private": true,
   "main": "src/main.js",
   "scripts": {
@@ -10,7 +11,7 @@
     "start": "node src/server/index.js",
     "build:renderer": "npm run build:desktop --prefix ../frontend",
     "dist:win": "npm run build:renderer && electron-builder --win nsis --x64",
-    "dist:win:dir": "electron-builder --win --dir"
+    "dist:linux": "npm run build:renderer && electron-builder --linux deb AppImage --x64"
   },
   "build": {
     "appId": "com.blacktracker.app",
@@ -32,13 +33,6 @@
         "filter": [
           "**/*"
         ]
-      },
-      {
-        "from": "vendor/node-win-x64",
-        "to": "node-runtime",
-        "filter": [
-          "**/*"
-        ]
       }
     ],
     "win": {
@@ -50,7 +44,16 @@
           ]
         }
       ],
-      "icon": "build/icon.ico"
+      "icon": "build/icon.ico",
+      "extraResources": [
+        {
+          "from": "vendor/node-win-x64",
+          "to": "node-runtime",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -58,6 +61,38 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "BlackTracker"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "Finance",
+      "synopsis": "BlackTracker — journal de trading et track record",
+      "description": "Application de bureau offline-first : journal de trading, track record, analytics et références de marchés.",
+      "executableName": "blacktracker",
+      "maintainer": "BlackTracker <nacanaboelvis7@gmail.com>",
+      "syncDesktopName": true,
+      "extraResources": [
+        {
+          "from": "vendor/node-linux-x64",
+          "to": "node-runtime",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
     }
   },
   "dependencies": {
