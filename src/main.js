@@ -63,15 +63,24 @@ async function waitForServer(timeoutMs = 30000) {
 }
 
 function startServer() {
-  serverProc = spawn(config.NODE_BIN, [path.join(config.DESKTOP_ROOT, 'src', 'server', 'index.js')], {
-    env: {
-      ...process.env,
-      BT_DESKTOP_PORT: String(config.PORT),
-      // En version packagée, le build du frontend est livré dans les ressources
-      // (electron-builder extraResources) : on le pointe ici, sinon le serveur
-      // chercherait ../frontend/dist-desktop qui n'existe pas dans le package.
-      ...(app.isPackaged ? { BT_FRONTEND_DIST: path.join(process.resourcesPath, 'frontend-dist') } : {}),
-    },
+  // En version packagée, on embarque un runtime Node portable (voir
+  // electron-builder extraResources -> node-runtime) : l'app est alors
+  // totalement autonome, Node n'a PAS besoin d'être installé sur le PC cible.
+  // On pointe aussi le build du frontend livré dans les ressources (il ne
+  // faut pas chercher ../frontend/dist-desktop qui n'existe pas dans le package).
+  const env = {
+    ...process.env,
+    BT_DESKTOP_PORT: String(config.PORT),
+    ...(app.isPackaged
+      ? {
+          BT_FRONTEND_DIST: path.join(process.resourcesPath, 'frontend-dist'),
+          BT_NODE_BIN: path.join(process.resourcesPath, 'node-runtime', process.platform === 'win32' ? 'node.exe' : 'node'),
+        }
+      : {}),
+  };
+  const nodeBin = app.isPackaged ? env.BT_NODE_BIN : config.NODE_BIN;
+  serverProc = spawn(nodeBin, [path.join(config.DESKTOP_ROOT, 'src', 'server', 'index.js')], {
+    env,
     stdio: 'inherit',
   });
   serverProc.on('exit', (code) => {

@@ -32,6 +32,13 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "vendor/node-win-x64",
+        "to": "node-runtime",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {

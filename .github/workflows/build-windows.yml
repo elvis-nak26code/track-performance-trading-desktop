@@ -47,12 +47,25 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      # 5. Génère l'installateur NSIS avec l'icône (desktop/build/icon.ico)
+      # 5. Runtime Node portable Windows (exécutable autonome : Node n'est pas
+      #    requis sur la machine cible). Le binaire est téléchargé ici plutôt
+      #    que commité dans le repo (82 Mo).
+      - name: Télécharger le runtime Node portable (Windows)
+        shell: pwsh
+        run: |
+          $node = "v22.23.2"
+          $tmp = Join-Path $env:RUNNER_TEMP "node.zip"
+          Invoke-WebRequest "https://nodejs.org/dist/$node/node-$node-win-x64.zip" -OutFile $tmp
+          Expand-Archive $tmp -DestinationPath (Join-Path $env:RUNNER_TEMP "node")
+          New-Item -ItemType Directory -Force -Path "desktop/vendor/node-win-x64" | Out-Null
+          Copy-Item (Join-Path $env:RUNNER_TEMP "node\node-$node-win-x64\node.exe") "desktop/vendor/node-win-x64\node.exe"
+
+      # 6. Génère l'installateur NSIS avec l'icône (desktop/build/icon.ico)
       - name: Build de l'exécutable Windows
         working-directory: desktop
         run: npx electron-builder --win nsis --x64
 
-      # 6. Récupère l'exécutable généré (téléchargeable dans l'onglet Actions)
+      # 7. Récupère l'exécutable généré (téléchargeable dans l'onglet Actions)
       - name: Upload de l'exécutable
         uses: actions/upload-artifact@v4
         with:
