@@ -1,0 +1,61 @@
+// Workflow GitHub Actions : à CHAQUE push, build l'exécutable Windows
+// (BlackTracker Setup .exe) avec l'icône, better-sqlite3 recompilé pour
+// Windows (module natif) et le rendu desktop re-fabriqué à partir du
+// frontend le plus récent — donc chaque mise à jour est prise en compte.
+name: Build Windows (BlackTracker)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+
+    steps:
+      # 1. Le code de l'app de bureau (ce repo) -> /workspace/desktop
+      - name: Checkout desktop
+        uses: actions/checkout@v4
+        with:
+          path: desktop
+
+      # 2. Le frontend le plus récent -> /workspace/frontend
+      #    (dépôt du frontend ; le build desktop a besoin de ../frontend)
+      - name: Checkout frontend (latest)
+        uses: actions/checkout@v4
+        with:
+          repository: elvis-nak26code/track-performance-trading
+          path: frontend
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 3. Fabrique le rendu desktop du frontend (vite mode desktop -> dist-desktop)
+      - name: Build du rendu desktop (vite build:desktop -> dist-desktop)
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:desktop
+
+      # 4. Installe l'app desktop : electron + better-sqlite3 compilé POUR WINDOWS
+      - name: Installation des dépendances desktop
+        working-directory: desktop
+        run: npm ci
+
+      # 5. Génère l'installateur NSIS avec l'icône (desktop/build/icon.ico)
+      - name: Build de l'exécutable Windows
+        working-directory: desktop
+        run: npx electron-builder --win nsis --x64
+
+      # 6. Récupère l'exécutable généré (téléchargeable dans l'onglet Actions)
+      - name: Upload de l'exécutable
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlackTracker-Windows-x64
+          path: desktop/release/*Setup*.exe
+          if-no-files-found: error

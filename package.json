@@ -1,0 +1,70 @@
+{
+  "name": "blacktracker-desktop",
+  "version": "1.0.0",
+  "description": "BlackTracker — application de bureau offline-first (Electron + base SQLite locale + synchro avec l'API distante).",
+  "author": "BlackTracker",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "app": "electron .",
+    "start": "node src/server/index.js",
+    "build:renderer": "npm run build:desktop --prefix ../frontend",
+    "dist:win": "npm run build:renderer && electron-builder --win nsis --x64",
+    "dist:win:dir": "electron-builder --win --dir"
+  },
+  "build": {
+    "appId": "com.blacktracker.app",
+    "productName": "BlackTracker",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "asar": false,
+    "npmRebuild": false,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../frontend/dist-desktop",
+        "to": "frontend-dist",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "BlackTracker"
+    }
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "multer": "^2.4.0"
+  },
+  "devDependencies": {
+    "electron": "^44.4.1",
+    "electron-builder": "^26.15.3"
+  },
+  "allowScripts": {
+    "electron@44.4.1": true
+  }
+}
