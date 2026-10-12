@@ -82,6 +82,9 @@ function startServer() {
   serverProc = spawn(nodeBin, [path.join(config.DESKTOP_ROOT, 'src', 'server', 'index.js')], {
     env,
     stdio: 'inherit',
+    // Sur Windows, node.exe est un programme "console" : sans cette option,
+    // une fenêtre de terminal noire s'ouvre à côté de l'application.
+    windowsHide: true,
   });
   serverProc.on('exit', (code) => {
     // eslint-disable-next-line no-console

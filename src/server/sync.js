@@ -12,8 +12,10 @@
 //   - Les images déjà sur le cloud sont rapatriées dans le dossier local pour
 //     rester consultables sans connexion.
 //
-// Le moteur tourne dans le processus du serveur local (un seul "tenant" :
-// le compte courant de la machine).
+// Deux bases distinctes sont utilisées (voir db.js) :
+//   - `state`   : session + comptes + indicateurs de synchro (global),
+//   - `data`    : données du compte courant, via `dataStore` (une base par
+//     compte, ouverte uniquement pour l'utilisateur connecté).
 // =============================================================================
 
 const path = require('path');
@@ -70,7 +72,7 @@ function remapEntryId(db, oldId, newId) {
   tx();
 }
 
-function createSync(db) {
+function createSync(state, dataStore) {
   let running = false;
   let timer = null;
 
@@ -80,23 +82,29 @@ function createSync(db) {
   }
 
   function getMeta(key) {
-    const row = db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
+    const row = state.prepare('SELECT value FROM meta WHERE key = ?').get(key);
     return row ? row.value : null;
   }
 
   function setMeta(key, value) {
-    db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
+    state.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
   }
 
   function session() {
-    const row = db.prepare('SELECT token, user_json FROM session WHERE id = 1').get();
+    const row = state.prepare('SELECT token, user_json FROM session WHERE id = 1').get();
     if (!row) return null;
     return { token: row.token, user: JSON.parse(row.user_json) };
   }
 
+  // Base de données des données du compte courant (null si aucune session).
+  function dataDb() {
+    const s = session();
+    return s ? dataStore.current(s.user.id) : null;
+  }
+
   // Supprime localement une ligne "créée puis supprimée hors ligne" : elle n'a
   // jamais existé côté serveur, la pierre tombale n'a pas besoin du réseau.
-  function dropLocalOnly(table, id) {
+  function dropLocalOnly(db, table, id) {
     db.prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
     db.prepare('UPDATE deleted_ops SET pushed = 1 WHERE collection = ? AND id = ?').run(table, id);
   }
@@ -104,7 +112,7 @@ function createSync(db) {
   // ============================== PUSH =========================================
 
   async function pushUsers(session) {
-    const row = db.prepare("SELECT data, op FROM users WHERE dirty = 1 LIMIT 1").get();
+    const row = state.prepare("SELECT data, op FROM users WHERE dirty = 1 LIMIT 1").get();
     if (!row) return;
     const user = JSON.parse(row.data);
     const push = {
@@ -120,19 +128,21 @@ function createSync(db) {
     }
     const fresh = r.json?.data;
     if (fresh) {
-      db.prepare("UPDATE users SET data = ?, updated_at = ?, dirty = 0 WHERE id = ?").run(JSON.stringify(fresh), new Date().toISOString(), user.id);
-      db.prepare('UPDATE session SET user_json = ? WHERE id = 1').run(JSON.stringify(fresh));
+      state.prepare("UPDATE users SET data = ?, updated_at = ?, dirty = 0 WHERE id = ?").run(JSON.stringify(fresh), new Date().toISOString(), user.id);
+      state.prepare('UPDATE session SET user_json = ? WHERE id = 1').run(JSON.stringify(fresh));
     }
   }
 
   async function pushTrades(session) {
+    const db = dataDb();
+    if (!db) return;
     const rows = db.prepare("SELECT id, data FROM trades WHERE dirty = 1").all();
     for (const row of rows) {
       let id = row.id;
       const data = row.data;
       const tomb = db.prepare("SELECT 1 FROM deleted_ops WHERE collection = 'trades' AND id = ?").get(id);
       if (tomb) {
-        dropLocalOnly('trades', id);
+        dropLocalOnly(db, 'trades', id);
         continue;
       }
       const trade = JSON.parse(data);
@@ -159,7 +169,7 @@ function createSync(db) {
   }
 
   // Construit le multipart équivalent à buildJournalFormData du frontend.
-  function buildEntryFormData(entry) {
+  function buildEntryFormData(db, entry) {
     const fd = new FormData();
     fd.append('date', entry.date || '');
     fd.append('instrument', entry.instrument || '');
@@ -186,15 +196,17 @@ function createSync(db) {
   }
 
   async function pushJournal(session) {
+    const db = dataDb();
+    if (!db) return;
     const rows = db.prepare("SELECT id, data FROM journal_entries WHERE dirty = 1").all();
     for (let { id } of rows) {
       const tomb = db.prepare("SELECT 1 FROM deleted_ops WHERE collection = 'journal_entries' AND id = ?").get(id);
       if (tomb) {
-        dropLocalOnly('journal_entries', id);
+        dropLocalOnly(db, 'journal_entries', id);
         continue;
       }
       const entry = JSON.parse(db.prepare('SELECT data FROM journal_entries WHERE id = ?').get(id).data);
-      const fd = buildEntryFormData(entry);
+      const fd = buildEntryFormData(db, entry);
       let r = await remote.request(`/journal-entries/${id}`, { method: 'PUT', body: fd, token: session.token });
       if (!r.ok && r.status === 0) return;
       if (r.status === 404) {
@@ -233,6 +245,8 @@ function createSync(db) {
   }
 
   async function pushMarkets(session) {
+    const db = dataDb();
+    if (!db) return;
     const rows = db.prepare("SELECT id, data FROM markets WHERE dirty = 1 AND is_custom = 1").all();
     for (const { data } of rows) {
       const market = JSON.parse(data);
@@ -255,13 +269,57 @@ function createSync(db) {
     }
   }
 
+  async function pushStrategies(session) {
+    const db = dataDb();
+    if (!db) return;
+    const rows = db.prepare("SELECT id, data FROM strategies WHERE dirty = 1").all();
+    for (let { id } of rows) {
+      const tomb = db.prepare("SELECT 1 FROM deleted_ops WHERE collection = 'strategies' AND id = ?").get(id);
+      if (tomb) {
+        dropLocalOnly(db, 'strategies', id);
+        continue;
+      }
+      const strategy = JSON.parse(db.prepare('SELECT data FROM strategies WHERE id = ?').get(id).data);
+      let r = await remote.request(`/strategies/${id}`, { method: 'PUT', body: strategy, token: session.token });
+      if (!r.ok && r.status === 0) return;
+      if (r.status === 404) {
+        r = await remote.request('/strategies', { method: 'POST', body: strategy, token: session.token });
+        if (r.ok) {
+          const fresh = r.json?.data;
+          if (fresh && fresh.id !== id) {
+            db.prepare('INSERT OR REPLACE INTO strategies (id, data, updated_at, dirty) VALUES (?, ?, ?, ?)').run(
+              fresh.id,
+              JSON.stringify(fresh),
+              new Date().toISOString(),
+              0
+            );
+            db.prepare('DELETE FROM strategies WHERE id = ?').run(id);
+            db.prepare("UPDATE deleted_ops SET id = ? WHERE collection = 'strategies' AND id = ?").run(fresh.id, id);
+            id = fresh.id;
+          }
+        }
+      }
+      if (!r.ok) {
+        if (r.status !== 0) log(`pousser stratégie refusé (${r.status}) — ${r.json?.message || ''}`.trim());
+        return;
+      }
+      const fresh = r.json?.data;
+      if (fresh) {
+        db.prepare("UPDATE strategies SET data = ?, updated_at = ?, dirty = 0 WHERE id = ?").run(JSON.stringify(fresh), new Date().toISOString(), fresh.id || id);
+      }
+    }
+  }
+
   async function pushDeletes(session) {
+    const db = dataDb();
+    if (!db) return;
     const tombRows = db.prepare('SELECT collection, id FROM deleted_ops WHERE pushed = 0').all();
     for (const { collection, id } of tombRows) {
       const map = {
         trades: `/trades/${id}`,
         journal_entries: `/journal-entries/${id}`,
         markets: `/markets/${id}`,
+        strategies: `/strategies/${id}`,
       }[collection];
       if (!map) continue;
       const r = await remote.request(map, { method: 'DELETE', token: session.token });
@@ -280,12 +338,15 @@ function createSync(db) {
     await pushTrades(session);
     await pushJournal(session);
     await pushMarkets(session);
+    await pushStrategies(session);
     await pushDeletes(session);
   }
 
   // ============================== PULL =========================================
 
   function upsertIfNotLocalNewer(table, id, data, updatedAt, extra = {}) {
+    const db = dataDb();
+    if (!db) return false;
     const row = db.prepare(`SELECT data, updated_at, dirty FROM ${table} WHERE id = ?`).get(id);
     if (row && dbm.localWins({ updated_at: row.updated_at, dirty: row.dirty }, updatedAt)) return false;
     db.prepare(
@@ -296,6 +357,8 @@ function createSync(db) {
   }
 
   async function pullTrades(session) {
+    const db = dataDb();
+    if (!db) return;
     const r = await remote.request('/trades', { token: session.token });
     if (!r.ok) return;
     for (const t of r.json?.data || []) {
@@ -306,23 +369,24 @@ function createSync(db) {
   }
 
   async function pullJournal(session) {
+    const db = dataDb();
+    if (!db) return;
     const r = await remote.request('/journal-entries', { token: session.token });
     if (!r.ok) return;
     for (const remoteEntry of r.json?.data || []) {
       const tomb = db.prepare("SELECT 1 FROM deleted_ops WHERE collection = 'journal_entries' AND id = ?").get(remoteEntry.id);
       if (tomb) continue;
       const row = db.prepare('SELECT data, updated_at, dirty FROM journal_entries WHERE id = ?').get(remoteEntry.id);
-      if (row && dbm.localWins({ updated_at: row.updated_at, dirty: row.dirty }, remoteEntry.updatedAt)) {
-        continue;
-      }
       const entry = { ...remoteEntry };
-      // Rapatriement des images Cloudinary dans le stockage local.
+      // On rapatrie TOUJOURS les captures manquantes dans le stockage local
+      // (retry des téléchargements qui ont échoué lors d'une passe précédente),
+      // même si l'entrée existe déjà en local.
       for (const shot of entry.screenshots || []) {
         const local = db.prepare('SELECT file_path, public_id FROM screenshots WHERE id = ?').get(shot.id);
         if (!local || !local.file_path) {
-          const dl = await images.downloadToLocal(entry.id, shot.id, shot.url);
-          const updatedAt = new Date().toISOString();
+          const dl = shot.url ? await images.downloadToLocal(entry.id, shot.id, shot.url) : null;
           if (dl) {
+            const updatedAt = new Date().toISOString();
             db.prepare('INSERT OR REPLACE INTO screenshots (id, entry_id, file_path, public_id, updated_at) VALUES (?, ?, ?, ?, ?)').run(
               shot.id,
               entry.id,
@@ -332,15 +396,24 @@ function createSync(db) {
             );
             shot.url = localUrl(dl.filePath);
           }
+          // Échec de téléchargement : on conserve l'URL distante (affiche en
+          // ligne) et on réessaiera à la prochaine passe de synchro.
         } else {
           shot.url = localUrl(local.file_path) || shot.url;
         }
+      }
+      // On ne sur-écrit pas une modification locale plus récente ni une entrée
+      // dont le contenu local est à jour (downloads ci-dessus déjà faits).
+      if (row && dbm.localWins({ updated_at: row.updated_at, dirty: row.dirty }, remoteEntry.updatedAt)) {
+        continue;
       }
       upsertIfNotLocalNewer('journal_entries', entry.id, JSON.stringify(entry), entry.updatedAt);
     }
   }
 
   async function pullMarkets(session) {
+    const db = dataDb();
+    if (!db) return;
     const r = await remote.request('/markets', { token: session.token });
     if (!r.ok) return;
     for (const m of r.json?.data || []) {
@@ -351,22 +424,34 @@ function createSync(db) {
     }
   }
 
+  async function pullStrategies(session) {
+    const db = dataDb();
+    if (!db) return;
+    const r = await remote.request('/strategies', { token: session.token });
+    if (!r.ok) return;
+    for (const s of r.json?.data || []) {
+      const tomb = db.prepare("SELECT 1 FROM deleted_ops WHERE collection = 'strategies' AND id = ?").get(s.id);
+      if (tomb) continue; // supprimée localement, on ne la réimporte pas
+      upsertIfNotLocalNewer('strategies', s.id, JSON.stringify(s), s.updatedAt);
+    }
+  }
+
   async function pullUser(session) {
     const r = await remote.request('/users/me', { token: session.token });
     if (!r.ok || !r.json?.data) return;
-    const local = db.prepare('SELECT dirty FROM users WHERE id = ?').get(r.json.data.id);
+    const local = state.prepare('SELECT dirty FROM users WHERE id = ?').get(r.json.data.id);
     if (local?.dirty) return; // modification locale à pousser d'abord
-    db.prepare('INSERT OR REPLACE INTO users (id, data, updated_at, dirty, op) VALUES (?, ?, ?, 0, ?)').run(
+    state.prepare('INSERT OR REPLACE INTO users (id, data, updated_at, dirty, op) VALUES (?, ?, ?, 0, ?)').run(
       r.json.data.id,
       JSON.stringify(r.json.data),
       new Date().toISOString(),
       'profile'
     );
-    db.prepare('UPDATE session SET user_json = ? WHERE id = 1').run(JSON.stringify(r.json.data));
+    state.prepare('UPDATE session SET user_json = ? WHERE id = 1').run(JSON.stringify(r.json.data));
   }
 
   async function pullAll(session) {
-    await Promise.all([pullTrades(session), pullJournal(session), pullMarkets(session), pullUser(session)]);
+    await Promise.all([pullTrades(session), pullJournal(session), pullMarkets(session), pullStrategies(session), pullUser(session)]);
   }
 
   // ============================== ORCHESTRATION =================================
@@ -398,12 +483,14 @@ function createSync(db) {
   // État courant visible par l'interface : en ligne, nombre d'éléments en
   // attente (mutations locales non poussées), dernière synchro réussie.
   function status() {
+    const db = dataDb();
     const pending =
-      (db.prepare('SELECT COUNT(*) AS c FROM trades WHERE dirty = 1').get().c || 0) +
-      (db.prepare('SELECT COUNT(*) AS c FROM journal_entries WHERE dirty = 1').get().c || 0) +
-      (db.prepare('SELECT COUNT(*) AS c FROM users WHERE dirty = 1').get().c || 0) +
-      (db.prepare('SELECT COUNT(*) AS c FROM markets WHERE dirty = 1').get().c || 0) +
-      (db.prepare('SELECT COUNT(*) AS c FROM deleted_ops WHERE pushed = 0').get().c || 0);
+      (db?.prepare('SELECT COUNT(*) AS c FROM trades WHERE dirty = 1').get().c || 0) +
+      (db?.prepare('SELECT COUNT(*) AS c FROM journal_entries WHERE dirty = 1').get().c || 0) +
+      (db?.prepare('SELECT COUNT(*) AS c FROM strategies WHERE dirty = 1').get().c || 0) +
+      (state.prepare('SELECT COUNT(*) AS c FROM users WHERE dirty = 1').get().c || 0) +
+      (db?.prepare('SELECT COUNT(*) AS c FROM markets WHERE dirty = 1').get().c || 0) +
+      (db?.prepare('SELECT COUNT(*) AS c FROM deleted_ops WHERE pushed = 0').get().c || 0);
     return {
       online: getMeta('sync_online') === '1',
       lastSyncAt: getMeta('sync_last_at') || null,

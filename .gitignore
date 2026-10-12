@@ -1,7 +1,23 @@
+# Builds et dépendances — jamais poussés au dépôt
 node_modules/
 release/
 dist/
-dist-desktop/
-vendor/node-win-x64/
-vendor/node-linux-x64/
-*.log
+vendor/
+
+# Runtime Node portable téléchargé par la CI
+node-win-x64/
+node-linux-x64/
+
+# Signe / identifiants
+*.p12
+*.pfx
+*.key
+*.cer
+certs/
+
+# Installateurs / archives lourds
+*.exe
+*.zip
+*.AppImage
+*.deb
+*.dmg

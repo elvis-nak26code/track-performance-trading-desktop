@@ -4,6 +4,7 @@
   "description": "BlackTracker — application de bureau offline-first (Electron + base SQLite locale + synchro avec l'API distante).",
   "author": "BlackTracker",
   "desktopName": "BlackTracker",
+  "homepage": "https://track-performance-trading-api.onrender.com",
   "private": true,
   "main": "src/main.js",
   "scripts": {
@@ -107,6 +108,7 @@
     "electron-builder": "^26.15.3"
   },
   "allowScripts": {
-    "electron@44.4.1": true
+    "electron@44.4.1": true,
+    "better-sqlite3@13.0.3": true
   }
 }

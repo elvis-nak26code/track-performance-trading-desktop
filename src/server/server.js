@@ -75,9 +75,12 @@ function planPayload(user) {
 
 // -- Multer : captures d'écran (mêmes règles que le backend distant) ----------
 
+// Plafond d'images aligné sur le cloud (voir API/src/middlewares/upload.middleware.js).
+const MAX_SCREENSHOTS = 20;
+
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 6 },
+  limits: { fileSize: 20 * 1024 * 1024, files: MAX_SCREENSHOTS },
   fileFilter(_req, file, cb) {
     if (!file.mimetype || !file.mimetype.startsWith('image/')) {
       return cb(new Error('Seules les images sont acceptées.'));
@@ -88,15 +91,26 @@ const upload = multer({
 
 // -- Fabrique de l'application --------------------------------------------------
 
-function createApp(db, deps = {}) {
+function createApp(state, deps = {}) {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '2mb' }));
 
+  // Base globale (session + comptes) : `state`.
+  // Données du compte courant : `dataStore` (un fichier SQLite par compte).
+  const dataStore = deps.data;
+  // Référence pointée sur la base de données du compte courant : chaque route
+  // de données l'appelle via useData() avant de manipuler les tables.
+  let db = null;
+  function useData(req) {
+    db = dataStore?.current(req.user.id) || null;
+    return db;
+  }
+
   // ----- Accès session + utilisateur -----------------------------------------
 
   function getSessionRow() {
-    return db.prepare('SELECT token, user_json FROM session WHERE id = 1').get() || null;
+    return state.prepare('SELECT token, user_json FROM session WHERE id = 1').get() || null;
   }
 
   // Retourne l'utilisateur courant depuis la table users (plus fraîche que la
@@ -104,22 +118,22 @@ function createApp(db, deps = {}) {
   function currentUser() {
     const session = getSessionRow();
     if (!session) return null;
-    const row = db.prepare('SELECT data FROM users WHERE id = ?').get(JSON.parse(session.user_json).id);
+    const row = state.prepare('SELECT data FROM users WHERE id = ?').get(JSON.parse(session.user_json).id);
     if (row) return obj(row.data);
     return obj(session.user_json);
   }
 
   function saveUser(user) {
     const userJson = JSON.stringify(user);
-    db.prepare(
+    state.prepare(
       'INSERT OR IGNORE INTO users (id, data, updated_at, dirty, op) VALUES (?, ?, ?, 0, ?)'
     ).run(user.id, userJson, nowIso(), 'profile');
-    db.prepare('UPDATE users SET data = ?, updated_at = ? WHERE id = ?').run(
+    state.prepare('UPDATE users SET data = ?, updated_at = ? WHERE id = ?').run(
       userJson,
       nowIso(),
       user.id
     );
-    db.prepare(
+    state.prepare(
       'INSERT INTO session (id, token, user_json, updated_at) VALUES (1, ?, ?, ?) ' +
         'ON CONFLICT(id) DO UPDATE SET token = excluded.token, user_json = excluded.user_json, updated_at = excluded.updated_at'
     ).run(getSessionRow()?.token || '', userJson, nowIso());
@@ -128,7 +142,7 @@ function createApp(db, deps = {}) {
   function markUserDirty(op) {
     const user = currentUser();
     if (!user) return;
-    db.prepare('UPDATE users SET dirty = 1, op = ?, updated_at = ? WHERE id = ?').run(op, nowIso(), user.id);
+    state.prepare('UPDATE users SET dirty = 1, op = ?, updated_at = ? WHERE id = ?').run(op, nowIso(), user.id);
   }
 
   // Middleware : valide le bearer token contre la session locale.
@@ -140,6 +154,19 @@ function createApp(db, deps = {}) {
       return fail(res, 401, 'Authentification requise. Jeton manquant ou invalide.');
     }
     req.user = obj(session.user_json);
+    if (dataStore) {
+      dataStore.current(req.user.id);
+      // Migration lazy des anciennes données (v2 stockage par compte) :
+      // possible qu'aucune session n'existait au démarrage. Ne migre que vers
+      // un compte historique, jamais vers un compte créé après l'upgrade.
+      if (state.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trades'").get()) {
+        try {
+          dbm.migrateLegacy(state, dataStore);
+        } catch {
+          // la migration retentera à la prochaine requête authentifiée
+        }
+      }
+    }
     next();
   }
 
@@ -163,7 +190,7 @@ function createApp(db, deps = {}) {
     }
     const { user, token } = r.json?.data || {};
     if (user && token) {
-      db.prepare(
+      state.prepare(
         'INSERT INTO session (id, token, user_json, updated_at) VALUES (1, ?, ?, ?) ' +
           'ON CONFLICT(id) DO UPDATE SET token = excluded.token, user_json = excluded.user_json, updated_at = excluded.updated_at'
       ).run(token, JSON.stringify(user), nowIso());
@@ -175,6 +202,17 @@ function createApp(db, deps = {}) {
   app.post('/api/auth/register', async (req, res) => proxyAuth(req, res, '/auth/register'));
   app.post('/api/auth/login', async (req, res) => proxyAuth(req, res, '/auth/login'));
   app.post('/api/auth/google', async (req, res) => proxyAuth(req, res, '/auth/google'));
+
+  // Mot de passe oublié : simple relais vers le cloud (pas de session locale).
+  async function proxyAuthSimple(req, res, path) {
+    const r = await remote.request(path, { method: 'POST', body: req.body });
+    res.status(r.status || 502).json(
+      r.json || { success: false, message: r.status === 0 ? 'Hors ligne : connexion requise.' : 'Le service distant a répondu avec une erreur.' }
+    );
+  }
+
+  app.post('/api/auth/forgot-password', async (req, res) => proxyAuthSimple(req, res, '/auth/forgot-password'));
+  app.post('/api/auth/reset-password', async (req, res) => proxyAuthSimple(req, res, '/auth/reset-password'));
 
   // ----- Profil / préférences --------------------------------------------------
 
@@ -298,6 +336,7 @@ function createApp(db, deps = {}) {
   }
 
   app.get('/api/trades', protect, (_req, res) => {
+    useData(_req);
     const deleted = new Set(db.prepare("SELECT id FROM deleted_ops WHERE collection = 'trades'").all().map((r) => r.id));
     const trades = dbm
       .list(db, 'trades')
@@ -307,12 +346,14 @@ function createApp(db, deps = {}) {
   });
 
   app.get('/api/trades/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM trades WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Trade introuvable.');
     res.json({ success: true, data: obj(row.data) });
   });
 
   app.post('/api/trades', protect, (req, res) => {
+    useData(req);
     const data = pickTrade(req.body);
     const error = validateTrade(data);
     if (error) return fail(res, 400, error);
@@ -320,6 +361,7 @@ function createApp(db, deps = {}) {
   });
 
   app.post('/api/trades/bulk', protect, (req, res) => {
+    useData(req);
     const { trades } = req.body;
     if (!Array.isArray(trades) || trades.length === 0) {
       return fail(res, 400, "Le champ 'trades' doit être un tableau non vide.");
@@ -334,6 +376,7 @@ function createApp(db, deps = {}) {
   });
 
   app.put('/api/trades/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM trades WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Trade introuvable.');
     const data = pickTrade(req.body);
@@ -346,6 +389,7 @@ function createApp(db, deps = {}) {
   });
 
   app.delete('/api/trades/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM trades WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Trade introuvable.');
     const now = nowIso();
@@ -419,6 +463,7 @@ function createApp(db, deps = {}) {
   }
 
   app.get('/api/journal-entries', protect, (_req, res) => {
+    useData(_req);
     const deleted = new Set(db.prepare("SELECT id FROM deleted_ops WHERE collection = 'journal_entries'").all().map((r) => r.id));
     const entries = dbm
       .list(db, 'journal_entries')
@@ -428,13 +473,15 @@ function createApp(db, deps = {}) {
   });
 
   app.get('/api/journal-entries/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM journal_entries WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Entrée de journal introuvable.');
     res.json({ success: true, data: obj(row.data) });
   });
 
-  app.post('/api/journal-entries', protect, requireActivePlan, upload.array('screenshots', 6), (req, res) => {
+  app.post('/api/journal-entries', protect, requireActivePlan, upload.array('screenshots', MAX_SCREENSHOTS), (req, res) => {
     try {
+      useData(req);
       const error = validateEntry(req.body);
       if (error) return fail(res, 400, error);
 
@@ -470,8 +517,9 @@ function createApp(db, deps = {}) {
     }
   });
 
-  app.put('/api/journal-entries/:id', protect, upload.array('screenshots', 6), (req, res) => {
+  app.put('/api/journal-entries/:id', protect, upload.array('screenshots', MAX_SCREENSHOTS), (req, res) => {
     try {
+      useData(req);
       const row = db.prepare('SELECT data FROM journal_entries WHERE id = ?').get(req.params.id);
       if (!row) return fail(res, 404, 'Entrée de journal introuvable.');
 
@@ -509,8 +557,8 @@ function createApp(db, deps = {}) {
         screenshots.push(storeScreenshotLocal(existing.id, newMetadata[i], files[i]));
       }
 
-      if (screenshots.length > 6) {
-        return fail(res, 400, 'Une entrée ne peut pas contenir plus de 6 captures.');
+      if (screenshots.length > MAX_SCREENSHOTS) {
+        return fail(res, 400, `Une entrée ne peut pas contenir plus de ${MAX_SCREENSHOTS} captures.`);
       }
 
       const updated = {
@@ -537,6 +585,7 @@ function createApp(db, deps = {}) {
   });
 
   app.delete('/api/journal-entries/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM journal_entries WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Entrée de journal introuvable.');
     const entry = obj(row.data);
@@ -549,6 +598,130 @@ function createApp(db, deps = {}) {
       images.removeFile(sr?.file_path);
       db.prepare('DELETE FROM screenshots WHERE id = ?').run(s.id);
     }
+    res.json({ success: true, data: { id: req.params.id } });
+  });
+
+  // ----- Stratégies (checklist pré-trade associée à la stratégie active) ---------
+
+  const STRATEGY_FIELDS = ['name', 'description', 'rules', 'config', 'checklistItems', 'isActive'];
+
+  function pickStrategy(body) {
+    const data = {};
+    STRATEGY_FIELDS.forEach((f) => {
+      if (body[f] !== undefined) data[f] = body[f];
+    });
+    return data;
+  }
+
+  function validateStrategy(data) {
+    if (data.name !== undefined && !String(data.name).trim()) return 'Le nom de la stratégie est requis.';
+    if (data.config && typeof data.config !== 'object') return 'La configuration doit être un objet.';
+    if (data.checklistItems !== undefined && !Array.isArray(data.checklistItems)) {
+      return 'La checklist doit être un tableau.';
+    }
+    return null;
+  }
+
+  function createStrategyRow(data) {
+    const now = nowIso();
+    const strategy = {
+      id: crypto.randomUUID(),
+      name: String(data.name || '').trim(),
+      description: data.description || '',
+      rules: data.rules || [],
+      config: data.config || {},
+      checklistItems: data.checklistItems || [],
+      isActive: data.isActive === true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    db.prepare('INSERT INTO strategies (id, data, updated_at, dirty) VALUES (?, ?, ?, 1)').run(
+      strategy.id,
+      dbm.rowJson(strategy),
+      now
+    );
+    return strategy;
+  }
+
+  function listStrategies() {
+    const deleted = new Set(db.prepare("SELECT id FROM deleted_ops WHERE collection = 'strategies'").all().map((r) => r.id));
+    return dbm
+      .list(db, 'strategies')
+      .filter((s) => !deleted.has(s.id))
+      .sort((a, b) => Number(b.isActive) - Number(a.isActive) || String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  }
+
+  app.get('/api/strategies', protect, (_req, res) => {
+    useData(_req);
+    res.json({ success: true, data: listStrategies() });
+  });
+
+  app.get('/api/strategies/active', protect, (_req, res) => {
+    useData(_req);
+    res.json({ success: true, data: listStrategies().find((s) => s.isActive) || null });
+  });
+
+  app.get('/api/strategies/:id', protect, (req, res) => {
+    useData(req);
+    const row = db.prepare('SELECT data FROM strategies WHERE id = ?').get(req.params.id);
+    if (!row) return fail(res, 404, 'Stratégie introuvable.');
+    res.json({ success: true, data: obj(row.data) });
+  });
+
+  app.post('/api/strategies', protect, (req, res) => {
+    useData(req);
+    const data = pickStrategy(req.body);
+    const error = validateStrategy(data);
+    if (error) return fail(res, 400, error);
+    const strategy = createStrategyRow(data);
+    // Première stratégie de l'utilisateur : on l'active par défaut.
+    if (data.isActive === undefined && listStrategies().length === 1) {
+      strategy.isActive = true;
+      db.prepare('UPDATE strategies SET data = ?, dirty = 1 WHERE id = ?').run(dbm.rowJson(strategy), strategy.id);
+    }
+    res.status(201).json({ success: true, data: strategy });
+  });
+
+  app.put('/api/strategies/:id', protect, (req, res) => {
+    useData(req);
+    const row = db.prepare('SELECT data FROM strategies WHERE id = ?').get(req.params.id);
+    if (!row) return fail(res, 404, 'Stratégie introuvable.');
+    const data = pickStrategy(req.body);
+    delete data.isActive; // l'activation passe par l'endpoint dédié (une seule active)
+    const error = validateStrategy({ ...obj(row.data), ...data });
+    if (error) return fail(res, 400, error);
+    const now = nowIso();
+    const updated = { ...obj(row.data), ...data, updatedAt: now };
+    db.prepare('UPDATE strategies SET data = ?, updated_at = ?, dirty = 1 WHERE id = ?').run(dbm.rowJson(updated), now, req.params.id);
+    res.json({ success: true, data: updated });
+  });
+
+  app.put('/api/strategies/:id/activate', protect, (req, res) => {
+    useData(req);
+    const row = db.prepare('SELECT data FROM strategies WHERE id = ?').get(req.params.id);
+    if (!row) return fail(res, 404, 'Stratégie introuvable.');
+    const now = nowIso();
+    // Désactive les autres stratégies de la liste locale.
+    db.prepare('SELECT data FROM strategies').all()
+      .map((r) => obj(r.data))
+      .filter((s) => s && s.isActive && s.id !== req.params.id)
+      .forEach((other) => {
+        other.isActive = false;
+        other.updatedAt = now;
+        db.prepare('UPDATE strategies SET data = ?, updated_at = ?, dirty = 1 WHERE id = ?').run(dbm.rowJson(other), now, other.id);
+      });
+    const activated = { ...obj(row.data), isActive: true, updatedAt: now };
+    db.prepare('UPDATE strategies SET data = ?, updated_at = ?, dirty = 1 WHERE id = ?').run(dbm.rowJson(activated), now, req.params.id);
+    res.json({ success: true, data: activated });
+  });
+
+  app.delete('/api/strategies/:id', protect, (req, res) => {
+    useData(req);
+    const row = db.prepare('SELECT data FROM strategies WHERE id = ?').get(req.params.id);
+    if (!row) return fail(res, 404, 'Stratégie introuvable.');
+    const now = nowIso();
+    db.prepare("INSERT OR REPLACE INTO deleted_ops (collection, id, deleted_at, pushed) VALUES ('strategies', ?, ?, 0)").run(req.params.id, now);
+    db.prepare('DELETE FROM strategies WHERE id = ?').run(req.params.id);
     res.json({ success: true, data: { id: req.params.id } });
   });
 
@@ -574,12 +747,14 @@ function createApp(db, deps = {}) {
   }
 
   app.get('/api/markets', protect, (_req, res) => {
+    useData(_req);
     const rows = db.prepare('SELECT data FROM markets WHERE hidden = 0').all().map((r) => obj(r.data)).filter(Boolean);
     rows.sort((a, b) => (a.category === b.category ? String(a.symbol).localeCompare(String(b.symbol)) : String(a.category).localeCompare(String(b.category))));
     res.json({ success: true, data: rows });
   });
 
   app.post('/api/markets', protect, (req, res) => {
+    useData(req);
     const data = pickMarket(req.body);
     const error = validateMarket(data);
     if (error) return fail(res, 400, error);
@@ -604,6 +779,7 @@ function createApp(db, deps = {}) {
   });
 
   app.delete('/api/markets/:id', protect, (req, res) => {
+    useData(req);
     const row = db.prepare('SELECT data FROM markets WHERE id = ?').get(req.params.id);
     if (!row) return fail(res, 404, 'Marché introuvable.');
     const market = obj(row.data);
@@ -619,13 +795,15 @@ function createApp(db, deps = {}) {
 
   // ----- Synchro (statut visible par la sidebar de l'application) --------------
 
-  app.get('/api/sync/status', protect, (_req, res) => {
+  app.get('/api/sync/status', protect, (req, res) => {
+    useData(req);
     const syncStatus = deps.sync?.status ? deps.sync.status() : { online: null, lastSyncAt: null, pending: 0 };
     res.json({ success: true, data: syncStatus });
   });
 
   // Déclenche une passe de synchro immédiate (bouton "Synchroniser").
-  app.post('/api/sync/now', protect, async (_req, res) => {
+  app.post('/api/sync/now', protect, async (req, res) => {
+    useData(req);
     if (!deps.sync) return fail(res, 503, 'Moteur de synchronisation indisponible.');
     try {
       await deps.sync.tick();

@@ -130,3 +130,38 @@ jobs:
             desktop/release/*.deb
             desktop/release/*.AppImage
           if-no-files-found: error
+
+  # Regroupe les installateurs (exe + deb + AppImage) dans une Release GitHub
+  # « latest » toujours à jour : le site web (légèrement) pointe vers
+  # https://github.com/<dépôt>/releases/latest/download/<fichier>.
+  publish:
+    needs: [build-win, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Récupérer l'installateur Windows
+        uses: actions/download-artifact@v4
+        with:
+          name: BlackTracker-Windows-x64
+          path: assets
+
+      - name: Récupérer les installateurs Linux
+        uses: actions/download-artifact@v4
+        with:
+          name: BlackTracker-Linux-x64
+          path: assets
+
+      - name: Publier / mettre à jour la Release « latest »
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: BlackTracker — dernier build
+          body: |
+            Build automatique (CI) : le site web et son lien « Télécharger »
+            pointent vers les fichiers de cette Release.
+          files: assets/*
+          allowUpdates: true
+          draft: false
+          prerelease: false
